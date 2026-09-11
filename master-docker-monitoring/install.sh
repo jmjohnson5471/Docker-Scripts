@@ -384,6 +384,7 @@ services:
       IPAM_DATABASE_PASS: \${PHPIPAM_DB_PASSWORD}
       IPAM_DATABASE_NAME: \${PHPIPAM_DB_NAME}
       IPAM_DATABASE_WEBHOST: "%"
+      IPAM_DISABLE_INSTALLER: "1"
     depends_on:
       phpipam-db:
         condition: service_healthy
@@ -551,6 +552,41 @@ wait_for_health() {
   return 0
 }
 
+phpipam_settings_table_exists() {
+  docker exec phpipam-db sh -c \
+    'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE" -Nse "SHOW TABLES LIKE '\''settings'\'';"' \
+    2>/dev/null | grep -qx "settings"
+}
+
+initialize_phpipam_schema_if_needed() {
+  say "Checking phpIPAM database schema"
+
+  if phpipam_settings_table_exists; then
+    echo "phpIPAM schema already exists; preserving current database."
+    return
+  fi
+
+  echo "Fresh/empty phpIPAM database detected."
+  echo "Importing /phpipam/db/SCHEMA.sql ..."
+
+  docker exec phpipam-web test -f /phpipam/db/SCHEMA.sql \
+    || die "phpIPAM schema file /phpipam/db/SCHEMA.sql was not found in phpipam-web."
+
+  docker exec phpipam-web cat /phpipam/db/SCHEMA.sql | \
+    docker exec -i phpipam-db sh -c \
+      'mariadb -u "$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"'
+
+  if phpipam_settings_table_exists; then
+    echo "phpIPAM schema import: OK"
+  else
+    die "phpIPAM schema import completed but the settings table was not detected."
+  fi
+
+  say "Restarting phpIPAM after schema initialization"
+  cd "$APP_ROOT"
+  docker compose -f "$MASTER_COMPOSE" restart phpipam-web phpipam-cron
+}
+
 verify_databases() {
   say "Performing database smoke tests"
 
@@ -559,7 +595,13 @@ verify_databases() {
     2>/dev/null | grep -qx "phpipam"; then
     echo "phpIPAM MariaDB database: OK"
   else
-    warn "phpIPAM database smoke test did not pass yet. Check: docker logs phpipam-db --tail=100"
+    warn "phpIPAM database smoke test did not pass yet."
+  fi
+
+  if phpipam_settings_table_exists; then
+    echo "phpIPAM schema/settings table: OK"
+  else
+    warn "phpIPAM settings table was not detected."
   fi
 
   if docker exec zabbix-db sh -c \
@@ -567,7 +609,7 @@ verify_databases() {
     >/dev/null 2>&1; then
     echo "Zabbix PostgreSQL database: OK"
   else
-    warn "Zabbix PostgreSQL smoke test did not pass yet. Check: docker logs zabbix-db --tail=100"
+    warn "Zabbix PostgreSQL smoke test did not pass yet."
   fi
 }
 
@@ -603,7 +645,12 @@ Zabbix:
 phpIPAM:
   http://${ip}:${PHPIPAM_WEB_PORT}
 
-  On a new installation, complete the phpIPAM first-run setup.
+  Fresh-install login:
+    Username: admin
+    Password: ipamadmin
+
+  Change the phpIPAM password immediately.
+  The phpIPAM installer is disabled automatically after schema initialization.
 
 Master commands:
   master-docker ps
@@ -675,6 +722,7 @@ main() {
   write_admin_helper
   start_stack
   wait_for_health
+  initialize_phpipam_schema_if_needed
   verify_databases
 
   say "Container status"
